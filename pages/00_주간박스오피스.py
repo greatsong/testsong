@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import plotly.express as px
 import time
+import re
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 
@@ -101,18 +102,13 @@ def show_top10_recent_accumulated(df, source_label):
         st.info("분석할 데이터가 없습니다.")
         return
 
-    # 영화 코드별 등장 주 수 계산 (순위표에 등장한 횟수)
     week_count_by_movie = df_valid.groupby("영화 코드")["집계 기간"].nunique().rename("등장 주 수")
 
-    # 영화 코드별로 집계 기간이 가장 최근인 행 찾기
-    # 집계 기간 문자열이 날짜 형식(YYYY-MM-DD 등)을 포함하므로 문자열 비교로도 최신순 정렬 가능
     df_valid_sorted = df_valid.sort_values("집계 기간", ascending=False)
     latest_rows = df_valid_sorted.drop_duplicates(subset="영화 코드", keep="first").copy()
 
-    # 등장 주 수 병합
     latest_rows = latest_rows.merge(week_count_by_movie, on="영화 코드", how="left")
 
-    # 누적 관객 수 결측 제거 후 정렬
     latest_rows = latest_rows.dropna(subset=["누적 관객 수"])
     top10 = latest_rows.sort_values("누적 관객 수", ascending=False).head(10).reset_index(drop=True)
 
@@ -120,24 +116,18 @@ def show_top10_recent_accumulated(df, source_label):
         st.info("누적 관객 수 데이터를 찾을 수 없어 순위를 계산할 수 없습니다.")
         return
 
-    # 분석 대상 자료 출처 표시
     st.caption(f"📌 분석에 사용한 자료: **{source_label}**")
 
-    # 실제 분석 기간 및 수집된 주 수 계산
     all_periods = sorted(df_valid["집계 기간"].dropna().unique())
     period_start = all_periods[0] if all_periods else "알 수 없음"
     period_end = all_periods[-1] if all_periods else "알 수 없음"
     total_weeks = len(all_periods)
 
-    # 표 출력
     display_cols = ["영화명", "개봉일", "집계 기간", "누적 관객 수", "등장 주 수"]
     top10_display = top10[display_cols].rename(columns={"집계 기간": "가장 최근 집계 기간"})
 
     st.dataframe(top10_display, use_container_width=True)
 
-    # -----------------------------
-    # Plotly 가로 막대그래프
-    # -----------------------------
     top10_sorted = top10.sort_values("누적 관객 수", ascending=True)
 
     fig = px.bar(
@@ -170,6 +160,166 @@ def show_top10_recent_accumulated(df, source_label):
     )
 
     st.plotly_chart(fig, use_container_width=True, key=f"top10_chart_{source_label}")
+
+
+# =========================================================
+# 공통 함수: 집계 기간 → 시작 날짜 파싱
+# =========================================================
+def parse_period_start_date(period_str):
+    """
+    '2024-01-01~2024-01-07' 또는 '2024-01-01-2024-01-07' 등의 형태에서
+    시작 날짜(YYYY-MM-DD)를 추출한다. 실패 시 None 반환.
+    """
+    if not period_str or pd.isna(period_str):
+        return None
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", str(period_str))
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    return None
+
+
+# =========================================================
+# 공통 함수: 연속 1위 기간 분석 TOP 10
+# =========================================================
+def show_top10_longest_first_rank_streak(df, source_label):
+    st.subheader("👑 연속 1위 기간이 긴 영화 TOP 10")
+
+    df_valid = df.dropna(subset=["영화 코드", "집계 기간", "순위"]).copy()
+
+    if df_valid.empty:
+        st.info("분석할 데이터가 없습니다.")
+        return
+
+    # 집계 기간별 시작 날짜 매핑 (같은 집계 기간 문자열은 같은 시작 날짜를 가짐)
+    unique_periods = df_valid["집계 기간"].unique()
+    period_to_start_date = {p: parse_period_start_date(p) for p in unique_periods}
+
+    df_valid["_시작일"] = df_valid["집계 기간"].map(period_to_start_date)
+
+    # 시작일을 파싱하지 못한 행은 연속성 계산에서 제외
+    parse_fail_count = df_valid["_시작일"].isna().sum()
+    if parse_fail_count > 0:
+        st.caption(f"⚠️ 집계 기간에서 날짜를 인식하지 못해 연속성 계산에서 제외한 자료: **{parse_fail_count}건**")
+
+    df_valid = df_valid.dropna(subset=["_시작일"])
+
+    if df_valid.empty:
+        st.info("집계 기간의 날짜를 인식할 수 없어 연속 1위 분석을 진행할 수 없습니다.")
+        return
+
+    # 전체 수집된 주(고유 시작일) 목록 - 실제 분석 기간 계산용
+    all_start_dates = sorted(df_valid["_시작일"].unique())
+    period_start_label = all_start_dates[0].strftime("%Y-%m-%d")
+    period_end_label = all_start_dates[-1].strftime("%Y-%m-%d")
+    total_weeks = len(all_start_dates)
+
+    # 각 집계 기간(주)에서 순위 1위인 영화만 추출
+    first_rank_df = df_valid[df_valid["순위"] == 1].copy()
+
+    if first_rank_df.empty:
+        st.info("1위를 차지한 영화 기록을 찾을 수 없습니다.")
+        return
+
+    # 시작일 기준 정렬
+    first_rank_df = first_rank_df.sort_values("_시작일").reset_index(drop=True)
+
+    # 영화별 전체 1위 횟수
+    total_first_rank_count = first_rank_df.groupby("영화 코드").size().rename("전체 1위 횟수")
+
+    # 영화 코드 -> 영화명, 개봉일 매핑 (가장 최근 값 사용)
+    info_map = (
+        df_valid.sort_values("_시작일", ascending=False)
+        .drop_duplicates(subset="영화 코드", keep="first")
+        .set_index("영화 코드")[["영화명", "개봉일"]]
+    )
+
+    # -----------------------------
+    # 영화별 연속 1위 기간(최대 연속 주 수) 계산
+    # 수집하지 못한 주가 중간에 있으면 연속으로 보지 않음 -> 시작일 차이가 정확히 7일인 경우만 연속
+    # -----------------------------
+    max_streak_by_movie = {}
+
+    for movie_cd, group in first_rank_df.groupby("영화 코드"):
+        dates = sorted(group["_시작일"].unique())
+
+        if len(dates) == 0:
+            max_streak_by_movie[movie_cd] = 0
+            continue
+
+        max_streak = 1
+        current_streak = 1
+
+        for i in range(1, len(dates)):
+            gap_days = (dates[i] - dates[i - 1]).days
+            if gap_days == 7:
+                current_streak += 1
+            else:
+                current_streak = 1
+            max_streak = max(max_streak, current_streak)
+
+        max_streak_by_movie[movie_cd] = max_streak
+
+    streak_series = pd.Series(max_streak_by_movie, name="가장 긴 연속 1위 기간")
+
+    # 결과 통합
+    result_df = pd.concat([total_first_rank_count, streak_series], axis=1).reset_index()
+    result_df = result_df.rename(columns={"index": "영화 코드"})
+    result_df = result_df.merge(info_map, on="영화 코드", how="left")
+
+    # 정렬: 연속 1위 기간 내림차순 -> 동일하면 전체 1위 횟수 내림차순
+    result_df = result_df.sort_values(
+        by=["가장 긴 연속 1위 기간", "전체 1위 횟수"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
+    top10_streak = result_df.head(10).copy()
+
+    if top10_streak.empty:
+        st.info("연속 1위 데이터를 계산할 수 없습니다.")
+        return
+
+    st.caption(f"📌 분석에 사용한 자료: **{source_label}**")
+
+    display_cols = ["영화명", "개봉일", "전체 1위 횟수", "가장 긴 연속 1위 기간"]
+    st.dataframe(top10_streak[display_cols], use_container_width=True)
+
+    # -----------------------------
+    # Plotly 가로 막대그래프
+    # -----------------------------
+    top10_streak_sorted = top10_streak.sort_values("가장 긴 연속 1위 기간", ascending=True)
+
+    fig = px.bar(
+        top10_streak_sorted,
+        x="가장 긴 연속 1위 기간",
+        y="영화명",
+        orientation="h",
+        custom_data=["영화명", "개봉일", "전체 1위 횟수", "가장 긴 연속 1위 기간"],
+    )
+
+    fig.update_traces(
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "개봉일: %{customdata[1]}<br>"
+            "전체 1위 횟수: %{customdata[2]}회<br>"
+            "가장 긴 연속 1위 기간: %{customdata[3]}주"
+            "<extra></extra>"
+        )
+    )
+
+    fig.update_layout(
+        title=(
+            f"연속 1위 기간이 긴 영화 TOP 10<br>"
+            f"<sub>분석 기간: {period_start_label} ~ {period_end_label} | 수집된 주 수: {total_weeks}주 | 자료 출처: {source_label}</sub>"
+        ),
+        xaxis_title="가장 긴 연속 1위 기간 (주)",
+        yaxis_title="영화명",
+        height=600
+    )
+
+    st.plotly_chart(fig, use_container_width=True, key=f"streak_chart_{source_label}")
 
 
 # =========================================================
@@ -315,6 +465,9 @@ with tab_api:
                 st.divider()
                 show_top10_recent_accumulated(df, source_label="API로 수집한 자료")
 
+                st.divider()
+                show_top10_longest_first_rank_streak(df, source_label="API로 수집한 자료")
+
 # =========================================================
 # [탭 2] CSV 업로드로 분석
 # =========================================================
@@ -353,5 +506,8 @@ with tab_upload:
 
                 st.divider()
                 show_top10_recent_accumulated(df_upload, source_label="업로드한 CSV 파일")
+
+                st.divider()
+                show_top10_longest_first_rank_streak(df_upload, source_label="업로드한 CSV 파일")
     else:
         st.info("분석할 CSV 파일을 업로드해 주세요.")
