@@ -163,22 +163,89 @@ def show_top10_recent_accumulated(df, source_label):
 
 
 # =========================================================
-# 공통 함수: 집계 기간 → 시작 날짜 파싱
+# 공통 함수: 집계 기간(yearWeekTime) 형식 자동 판별
 # =========================================================
-def parse_period_start_date(period_str):
+def detect_and_parse_period(period_series):
     """
-    '2024-01-01~2024-01-07' 또는 '2024-01-01-2024-01-07' 등의 형태에서
-    시작 날짜(YYYY-MM-DD)를 추출한다. 실패 시 None 반환.
+    KOBIS 공식 API 문서 기준: yearWeekTime 필드는
+    'YYYYIW' (ISO 8601 연도 4자리 + 주차 2자리, 총 6자리) 형식으로 응답된다.
+    (예: '202636' -> 2026년 36주차)
+
+    다만 문서에 명시되지 않은 예외적 응답 형식에도 대응하기 위해
+    날짜 범위 형식(YYYYMMDD~YYYYMMDD 등)도 후보로 함께 검사한다.
+
+    반환값:
+      - period_to_key: {원본 문자열: 정수 키(정렬/비교용)} 매핑
+      - detected_format: 실제로 채택된 형식 이름 (문자열)
+      - fail_samples: 인식하지 못한 값들의 샘플 (최대 10개)
     """
-    if not period_str or pd.isna(period_str):
-        return None
-    match = re.search(r"(\d{4}-\d{2}-\d{2})", str(period_str))
-    if match:
-        try:
-            return datetime.strptime(match.group(1), "%Y-%m-%d").date()
-        except ValueError:
-            return None
-    return None
+    unique_periods = [p for p in period_series.dropna().unique()]
+
+    format_candidates = [
+        (
+            "YYYYIW (ISO 8601 연도+주차, KOBIS 공식 형식)",
+            r"^(\d{4})(\d{2})$",
+            lambda m: int(m.group(1)) * 100 + int(m.group(2))
+        ),
+        (
+            "YYYYMMDD~YYYYMMDD (날짜 범위, 예외 대응)",
+            r"^(\d{8})~\d{8}$",
+            lambda m: int(m.group(1))
+        ),
+        (
+            "YYYY-MM-DD~YYYY-MM-DD (하이픈 날짜 범위, 예외 대응)",
+            r"^(\d{4})-(\d{2})-(\d{2})~",
+            lambda m: int(m.group(1)) * 10000 + int(m.group(2)) * 100 + int(m.group(3))
+        ),
+    ]
+
+    best_format = None
+    best_period_to_key = {}
+    best_fail_samples = []
+    best_success_count = -1
+
+    for format_name, pattern, key_func in format_candidates:
+        period_to_key = {}
+        fail_samples = []
+
+        for p in unique_periods:
+            text = str(p).strip()
+            match = re.match(pattern, text)
+            if match:
+                try:
+                    period_to_key[p] = key_func(match)
+                except (ValueError, IndexError):
+                    fail_samples.append(p)
+            else:
+                fail_samples.append(p)
+
+        success_count = len(period_to_key)
+
+        if success_count > best_success_count:
+            best_success_count = success_count
+            best_format = format_name
+            best_period_to_key = period_to_key
+            best_fail_samples = fail_samples
+
+    if best_success_count <= 0:
+        return {}, None, unique_periods[:10]
+
+    return best_period_to_key, best_format, best_fail_samples[:10]
+
+
+def build_rank_order_from_keys(period_to_key):
+    """
+    정수 키를 정렬한 뒤, 실제 존재하는 값들 사이의 순번(등수)을 매긴다.
+    이렇게 하면 52주/53주 같은 특정 ISO 주차 체계의 예외(연도별 주차 수 차이)를
+    가정하지 않고도, '정렬했을 때 바로 다음/이전 값인지'만으로 연속성을 판단할 수 있다.
+
+    반환값: {원본 집계기간 문자열: 순번(정수, 작을수록 과거)}
+    """
+    sorted_items = sorted(period_to_key.items(), key=lambda x: x[1])
+    period_to_rank = {}
+    for idx, (period, _) in enumerate(sorted_items):
+        period_to_rank[period] = idx
+    return period_to_rank
 
 
 # =========================================================
@@ -193,28 +260,40 @@ def show_top10_longest_first_rank_streak(df, source_label):
         st.info("분석할 데이터가 없습니다.")
         return
 
-    # 집계 기간별 시작 날짜 매핑 (같은 집계 기간 문자열은 같은 시작 날짜를 가짐)
-    unique_periods = df_valid["집계 기간"].unique()
-    period_to_start_date = {p: parse_period_start_date(p) for p in unique_periods}
+    # -----------------------------
+    # 형식을 가정하지 않고 실제 값으로 자동 판별
+    # -----------------------------
+    period_to_key, detected_format, fail_samples = detect_and_parse_period(df_valid["집계 기간"])
 
-    df_valid["_시작일"] = df_valid["집계 기간"].map(period_to_start_date)
-
-    # 시작일을 파싱하지 못한 행은 연속성 계산에서 제외
-    parse_fail_count = df_valid["_시작일"].isna().sum()
-    if parse_fail_count > 0:
-        st.caption(f"⚠️ 집계 기간에서 날짜를 인식하지 못해 연속성 계산에서 제외한 자료: **{parse_fail_count}건**")
-
-    df_valid = df_valid.dropna(subset=["_시작일"])
-
-    if df_valid.empty:
-        st.info("집계 기간의 날짜를 인식할 수 없어 연속 1위 분석을 진행할 수 없습니다.")
+    if detected_format is None:
+        st.error("⚠️ 집계 기간 값의 형식을 인식할 수 없어 연속 1위 분석을 진행할 수 없습니다.")
+        st.write("인식 실패한 값 예시:", fail_samples)
         return
 
-    # 전체 수집된 주(고유 시작일) 목록 - 실제 분석 기간 계산용
-    all_start_dates = sorted(df_valid["_시작일"].unique())
-    period_start_label = all_start_dates[0].strftime("%Y-%m-%d")
-    period_end_label = all_start_dates[-1].strftime("%Y-%m-%d")
-    total_weeks = len(all_start_dates)
+    st.caption(f"🔍 인식된 집계 기간 형식: **{detected_format}**")
+
+    df_valid["_기간키"] = df_valid["집계 기간"].map(period_to_key)
+
+    parse_fail_count = df_valid["_기간키"].isna().sum()
+    if parse_fail_count > 0:
+        fail_values = df_valid.loc[df_valid["_기간키"].isna(), "집계 기간"].unique()[:10]
+        st.caption(f"⚠️ 인식하지 못해 연속성 계산에서 제외한 자료: **{parse_fail_count}건** (예시: {list(fail_values)})")
+
+    df_valid = df_valid.dropna(subset=["_기간키"])
+
+    if df_valid.empty:
+        st.info("집계 기간을 인식할 수 없어 연속 1위 분석을 진행할 수 없습니다.")
+        return
+
+    # 정렬 순번(등수) 부여: 특정 주차 체계를 가정하지 않고 '실제 존재하는 값들의 순서'만 사용
+    period_to_rank = build_rank_order_from_keys(period_to_key)
+    df_valid["_순번"] = df_valid["집계 기간"].map(period_to_rank)
+
+    # 실제 분석 기간 표시용
+    sorted_periods_for_display = sorted(df_valid["집계 기간"].unique(), key=lambda p: period_to_key[p])
+    period_start_label = str(sorted_periods_for_display[0])
+    period_end_label = str(sorted_periods_for_display[-1])
+    total_weeks = len(sorted_periods_for_display)
 
     # 각 집계 기간(주)에서 순위 1위인 영화만 추출
     first_rank_df = df_valid[df_valid["순위"] == 1].copy()
@@ -223,38 +302,37 @@ def show_top10_longest_first_rank_streak(df, source_label):
         st.info("1위를 차지한 영화 기록을 찾을 수 없습니다.")
         return
 
-    # 시작일 기준 정렬
-    first_rank_df = first_rank_df.sort_values("_시작일").reset_index(drop=True)
+    first_rank_df = first_rank_df.sort_values("_순번").reset_index(drop=True)
 
     # 영화별 전체 1위 횟수
     total_first_rank_count = first_rank_df.groupby("영화 코드").size().rename("전체 1위 횟수")
 
     # 영화 코드 -> 영화명, 개봉일 매핑 (가장 최근 값 사용)
     info_map = (
-        df_valid.sort_values("_시작일", ascending=False)
+        df_valid.sort_values("_순번", ascending=False)
         .drop_duplicates(subset="영화 코드", keep="first")
         .set_index("영화 코드")[["영화명", "개봉일"]]
     )
 
     # -----------------------------
     # 영화별 연속 1위 기간(최대 연속 주 수) 계산
-    # 수집하지 못한 주가 중간에 있으면 연속으로 보지 않음 -> 시작일 차이가 정확히 7일인 경우만 연속
+    # '실제 존재하는 값들의 순번'이 정확히 1씩 이어질 때만 연속으로 인정
+    # (수집하지 못한 주가 중간에 있으면 순번이 끊기므로 자동으로 연속이 아니게 됨)
     # -----------------------------
     max_streak_by_movie = {}
 
     for movie_cd, group in first_rank_df.groupby("영화 코드"):
-        dates = sorted(group["_시작일"].unique())
+        ranks = sorted(group["_순번"].unique())
 
-        if len(dates) == 0:
+        if len(ranks) == 0:
             max_streak_by_movie[movie_cd] = 0
             continue
 
         max_streak = 1
         current_streak = 1
 
-        for i in range(1, len(dates)):
-            gap_days = (dates[i] - dates[i - 1]).days
-            if gap_days == 7:
+        for i in range(1, len(ranks)):
+            if ranks[i] - ranks[i - 1] == 1:
                 current_streak += 1
             else:
                 current_streak = 1
@@ -363,9 +441,10 @@ with tab_api:
 
         def fetch_weekly_box_office(target_dt_str, week_gb="0"):
             """
-            공식 안내: targetDt에 조회하고자 하는 주(week)에 포함된 임의의 날짜(YYYYMMDD)를 넣으면
-            KOBIS가 해당 날짜가 속한 주의 집계 기간으로 자동 변환하여 응답한다.
-            weekGb: 0(주간, 월~일), 1(주말), 2(주중)
+            공식 안내: targetDt(YYYYMMDD)에 조회하고자 하는 날짜를 넣으면
+            그 날짜가 속한 주의 주간 박스오피스를 반환한다.
+            weekGb: "0"(주간, 월~일), "1"(주말, 금~일, default), "2"(주중, 월~목)
+            응답의 yearWeekTime 필드는 'YYYYIW'(연도+ISO 주차) 형식이다.
             """
             params = {
                 "key": KOBIS_KEY,
@@ -477,13 +556,23 @@ with tab_upload:
     uploaded_file = st.file_uploader("CSV 파일 업로드", type=["csv"])
 
     if uploaded_file is not None:
-        try:
-            upload_df_raw = pd.read_csv(uploaded_file)
-        except Exception as e:
-            st.error(f"⚠️ CSV 파일을 읽는 중 오류가 발생했습니다: {e}")
-            upload_df_raw = None
+        upload_df_raw = None
+        last_error = None
 
-        if upload_df_raw is not None:
+        for encoding in ["utf-8-sig", "utf-8", "cp949", "euc-kr"]:
+            try:
+                uploaded_file.seek(0)
+                candidate_df = pd.read_csv(uploaded_file, encoding=encoding)
+                if "집계 기간" in candidate_df.columns:
+                    upload_df_raw = candidate_df
+                    break
+            except Exception as e:
+                last_error = e
+                continue
+
+        if upload_df_raw is None:
+            st.error(f"⚠️ CSV 파일을 읽을 수 없습니다. 인코딩 또는 컬럼 형식을 확인해 주세요. ({last_error})")
+        else:
             required_cols = ["집계 기간", "영화 코드", "영화명", "개봉일", "순위", "주간 관객 수", "누적 관객 수"]
             missing_cols = [c for c in required_cols if c not in upload_df_raw.columns]
 
