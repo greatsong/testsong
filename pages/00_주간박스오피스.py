@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
+import plotly.express as px
 import time
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -9,7 +10,7 @@ st.set_page_config(page_title="KOBIS 주간 박스오피스", layout="wide")
 st.title("🎬 KOBIS 주간 박스오피스 (52주 누적 조회)")
 
 # =========================================================
-# 공통 함수: 데이터 정리 (형변환) 및 표시
+# 공통 함수: 데이터 정리 (형변환)
 # =========================================================
 def clean_dataframe(raw_rows):
     """API 응답 리스트 또는 업로드된 원본 데이터를 표준 컬럼으로 정리"""
@@ -83,8 +84,92 @@ def show_result_table(df, fail_convert_count, source_label=""):
         label="⬇️ CSV 파일로 다운로드",
         data=csv_buffer.getvalue(),
         file_name="kobis_weekly_boxoffice.csv",
-        mime="text/csv"
+        mime="text/csv",
+        key=f"download_{source_label}"
     )
+
+
+# =========================================================
+# 공통 함수: 영화별 최근 누적 관객 수 TOP 10 분석
+# =========================================================
+def show_top10_recent_accumulated(df, source_label):
+    st.subheader("🏆 영화별 최근 누적 관객 수 TOP 10")
+
+    df_valid = df.dropna(subset=["영화 코드", "집계 기간"]).copy()
+
+    if df_valid.empty:
+        st.info("분석할 데이터가 없습니다.")
+        return
+
+    # 영화 코드별 등장 주 수 계산 (순위표에 등장한 횟수)
+    week_count_by_movie = df_valid.groupby("영화 코드")["집계 기간"].nunique().rename("등장 주 수")
+
+    # 영화 코드별로 집계 기간이 가장 최근인 행 찾기
+    # 집계 기간 문자열이 날짜 형식(YYYY-MM-DD 등)을 포함하므로 문자열 비교로도 최신순 정렬 가능
+    df_valid_sorted = df_valid.sort_values("집계 기간", ascending=False)
+    latest_rows = df_valid_sorted.drop_duplicates(subset="영화 코드", keep="first").copy()
+
+    # 등장 주 수 병합
+    latest_rows = latest_rows.merge(week_count_by_movie, on="영화 코드", how="left")
+
+    # 누적 관객 수 결측 제거 후 정렬
+    latest_rows = latest_rows.dropna(subset=["누적 관객 수"])
+    top10 = latest_rows.sort_values("누적 관객 수", ascending=False).head(10).reset_index(drop=True)
+
+    if top10.empty:
+        st.info("누적 관객 수 데이터를 찾을 수 없어 순위를 계산할 수 없습니다.")
+        return
+
+    # 분석 대상 자료 출처 표시
+    st.caption(f"📌 분석에 사용한 자료: **{source_label}**")
+
+    # 실제 분석 기간 및 수집된 주 수 계산
+    all_periods = sorted(df_valid["집계 기간"].dropna().unique())
+    period_start = all_periods[0] if all_periods else "알 수 없음"
+    period_end = all_periods[-1] if all_periods else "알 수 없음"
+    total_weeks = len(all_periods)
+
+    # 표 출력
+    display_cols = ["영화명", "개봉일", "집계 기간", "누적 관객 수", "등장 주 수"]
+    top10_display = top10[display_cols].rename(columns={"집계 기간": "가장 최근 집계 기간"})
+
+    st.dataframe(top10_display, use_container_width=True)
+
+    # -----------------------------
+    # Plotly 가로 막대그래프
+    # -----------------------------
+    top10_sorted = top10.sort_values("누적 관객 수", ascending=True)
+
+    fig = px.bar(
+        top10_sorted,
+        x="누적 관객 수",
+        y="영화명",
+        orientation="h",
+        custom_data=["영화명", "개봉일", "집계 기간", "누적 관객 수", "등장 주 수"],
+    )
+
+    fig.update_traces(
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "개봉일: %{customdata[1]}<br>"
+            "가장 최근 집계 기간: %{customdata[2]}<br>"
+            "누적 관객 수: %{customdata[3]:,}명<br>"
+            "등장 주 수: %{customdata[4]}주"
+            "<extra></extra>"
+        )
+    )
+
+    fig.update_layout(
+        title=(
+            f"영화별 최근 누적 관객 수 TOP 10<br>"
+            f"<sub>분석 기간: {period_start} ~ {period_end} | 수집된 주 수: {total_weeks}주 | 자료 출처: {source_label}</sub>"
+        ),
+        xaxis_title="누적 관객 수",
+        yaxis_title="영화명",
+        height=600
+    )
+
+    st.plotly_chart(fig, use_container_width=True, key=f"top10_chart_{source_label}")
 
 
 # =========================================================
@@ -225,13 +310,16 @@ with tab_api:
                         st.write(f"- {p}")
 
                 df, fail_convert_count = clean_dataframe(all_rows)
-                show_result_table(df, fail_convert_count, source_label="(API 수집 결과)")
+                show_result_table(df, fail_convert_count, source_label="API 수집 결과")
+
+                st.divider()
+                show_top10_recent_accumulated(df, source_label="API로 수집한 자료")
 
 # =========================================================
 # [탭 2] CSV 업로드로 분석
 # =========================================================
 with tab_upload:
-    st.write("이전에 다운로드한 CSV 파일을 업로드하면 동일한 형식으로 표와 중복 검사를 확인할 수 있습니다.")
+    st.write("이전에 다운로드한 CSV 파일을 업로드하면 동일한 형식으로 표와 중복 검사, TOP 10 분석을 확인할 수 있습니다.")
 
     uploaded_file = st.file_uploader("CSV 파일 업로드", type=["csv"])
 
@@ -261,6 +349,9 @@ with tab_upload:
                     for p in sorted_periods_upload:
                         st.write(f"- {p}")
 
-                show_result_table(df_upload, fail_convert_count_upload, source_label="(업로드 파일 분석 결과)")
+                show_result_table(df_upload, fail_convert_count_upload, source_label="업로드 파일 분석 결과")
+
+                st.divider()
+                show_top10_recent_accumulated(df_upload, source_label="업로드한 CSV 파일")
     else:
         st.info("분석할 CSV 파일을 업로드해 주세요.")
