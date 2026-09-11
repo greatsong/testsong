@@ -2,6 +2,8 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 from datetime import datetime, timedelta, timezone
 
 st.set_page_config(page_title="일별 박스오피스", layout="wide")
@@ -130,7 +132,7 @@ st.subheader("📊 당일 관객 수 기준 그래프")
 
 df_sorted = df.sort_values("당일 관객 수", ascending=True)
 
-fig = px.bar(
+fig_bar = px.bar(
     df_sorted,
     x="당일 관객 수",
     y="영화명",
@@ -138,7 +140,7 @@ fig = px.bar(
     custom_data=["영화명", "개봉일", "당일 관객 수", "누적 관객 수"],
 )
 
-fig.update_traces(
+fig_bar.update_traces(
     hovertemplate=(
         "<b>%{customdata[0]}</b><br>"
         "개봉일: %{customdata[1]}<br>"
@@ -148,10 +150,124 @@ fig.update_traces(
     )
 )
 
-fig.update_layout(
+fig_bar.update_layout(
     xaxis_title="당일 관객 수",
     yaxis_title="영화명",
     height=600
 )
 
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig_bar, use_container_width=True)
+
+# -----------------------------
+# 8. 1위 영화 집중도 분석 (도넛 차트)
+# -----------------------------
+st.subheader("🍩 1위 영화 집중도 분석")
+
+# 당일 관객 수 기준 내림차순 정렬 후 상위 10편 추출
+df_top10 = df.sort_values("당일 관객 수", ascending=False).head(10).reset_index(drop=True)
+
+if df_top10.empty:
+    st.info("분석할 데이터가 없습니다.")
+else:
+    top1 = df_top10.iloc[0]
+    rest_df = df_top10.iloc[1:]
+
+    top1_name = top1["영화명"]
+    top1_open_dt = top1["개봉일"]
+
+    # --- 관객 수 집계 ---
+    top1_audi = top1["당일 관객 수"]
+    rest_audi_sum = rest_df["당일 관객 수"].sum()
+    total_audi = top1_audi + rest_audi_sum
+    audi_ratio = (top1_audi / total_audi * 100) if total_audi > 0 else 0
+
+    # --- 상영 횟수 집계 ---
+    top1_show = top1["상영 횟수"]
+    rest_show_sum = rest_df["상영 횟수"].sum()
+    total_show = top1_show + rest_show_sum
+    show_ratio = (top1_show / total_show * 100) if total_show > 0 else 0
+
+    labels = ["1위 영화", "나머지 9편"]
+
+    # -----------------------------
+    # 첫 번째 도넛 차트: 당일 관객 수
+    # -----------------------------
+    fig_donut1 = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=[top1_audi, rest_audi_sum],
+        hole=0.6,
+        sort=False,
+        customdata=[
+            [top1_name, top1_open_dt, top1_audi, rest_audi_sum, total_audi, audi_ratio],
+            [top1_name, top1_open_dt, top1_audi, rest_audi_sum, total_audi, audi_ratio],
+        ],
+        hovertemplate=(
+            "<b>%{label}</b><br>"
+            "1위 영화(%{customdata[0]}) 당일 관객 수: %{customdata[2]:,}명<br>"
+            "나머지 9편 합계: %{customdata[3]:,}명<br>"
+            "상위 10편 전체 합계: %{customdata[4]:,}명<br>"
+            "1위 영화 비율: %{customdata[5]:.1f}%"
+            "<extra></extra>"
+        ),
+        marker=dict(colors=["#EF553B", "#D3D3D3"])
+    )])
+
+    fig_donut1.update_layout(
+        title="상위 10편의 관객 중 1위 영화의 비율",
+        annotations=[dict(
+            text=f"{audi_ratio:.1f}%",
+            x=0.5, y=0.5,
+            font_size=24,
+            showarrow=False
+        )],
+        showlegend=True,
+        height=450
+    )
+
+    # -----------------------------
+    # 두 번째 도넛 차트: 상영 횟수
+    # -----------------------------
+    fig_donut2 = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=[top1_show, rest_show_sum],
+        hole=0.6,
+        sort=False,
+        customdata=[
+            [top1_name, top1_open_dt, top1_show, rest_show_sum, total_show, show_ratio],
+            [top1_name, top1_open_dt, top1_show, rest_show_sum, total_show, show_ratio],
+        ],
+        hovertemplate=(
+            "<b>%{label}</b><br>"
+            "1위 영화(%{customdata[0]}) 상영 횟수: %{customdata[2]:,}회<br>"
+            "나머지 9편 합계: %{customdata[3]:,}회<br>"
+            "상위 10편 전체 합계: %{customdata[4]:,}회<br>"
+            "1위 영화 비율: %{customdata[5]:.1f}%"
+            "<extra></extra>"
+        ),
+        marker=dict(colors=["#636EFA", "#D3D3D3"])
+    )])
+
+    fig_donut2.update_layout(
+        title="상위 10편의 상영 횟수 중 1위 영화의 비율",
+        annotations=[dict(
+            text=f"{show_ratio:.1f}%",
+            x=0.5, y=0.5,
+            font_size=24,
+            showarrow=False
+        )],
+        showlegend=True,
+        height=450
+    )
+
+    # -----------------------------
+    # 두 차트를 나란히 배치
+    # -----------------------------
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.plotly_chart(fig_donut1, use_container_width=True)
+
+    with col2:
+        st.plotly_chart(fig_donut2, use_container_width=True)
+
+    st.caption(f"📌 분석 대상 1위 영화: **{top1_name}** (개봉일: {top1_open_dt})")
